@@ -61,6 +61,7 @@ if not GROQ_API_KEY:
 llm = ChatGroq(
     model="openai/gpt-oss-20b",
     api_key=GROQ_API_KEY,
+    max_tokens=512,
 )
 
 # =========================
@@ -113,6 +114,41 @@ AGENT_ORDER = [
 ]
 
 
+def _prompt_excerpt(value: Any, max_chars: int = 800) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= max_chars:
+        return text
+
+    marker = "\n[truncated]"
+    return text[: max_chars - len(marker)].rstrip() + marker
+
+
+def _aviation_result_text(value: Any, label: str) -> str:
+    if isinstance(value, list):
+        text = "\n".join(
+            item["text"]
+            for item in value
+            if isinstance(item, dict)
+            and item.get("type") == "text"
+            and isinstance(item.get("text"), str)
+        )
+        if not text:
+            text = str(value)
+    else:
+        text = str(value)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict) and parsed.get("ok") is False:
+        error = str(parsed.get("error") or "The provider returned an error.")
+        return f"Live {label} unavailable: {error}"
+
+    return _prompt_excerpt(parsed if parsed is not None else text)
+
+
 def _llm_text(system_prompt: str, user_prompt: str) -> str:
     response = llm.invoke(
         [
@@ -149,7 +185,7 @@ def _empty_constraints() -> dict[str, Any]:
 # Supervisor Agent + Input Guardrail
 # =========================
 def supervisor_agent(state: TravelState):
-    query = state["user_query"]
+    query = _prompt_excerpt(state["user_query"], 1200)
     llm_calls = state.get("llm_calls", 0)
 
     guardrail_prompt = f"""
@@ -169,6 +205,10 @@ Return strict JSON only:
 
 User request:
 {query}
+
+If this request contains a latest traveler revision, treat it as authoritative
+over conflicting earlier details and preserve earlier details only when they
+do not conflict with the latest revision.
 """
 
     # Fail open on parser/model errors so a temporary JSON-format issue does not
@@ -321,7 +361,7 @@ Return concise travel guidance.
 
 def flight_agent(state: TravelState):
     print("\nINSIDE FLIGHT AGENT\n")
-    query = state["user_query"]
+    query = _prompt_excerpt(state["user_query"], 1200)
 
     try:
         airports = asyncio.run(aviation_mcp_call("list_airports"))
@@ -332,14 +372,21 @@ def flight_agent(state: TravelState):
 
         prompt = FLIGHT_AGENT_PROMPT.format(
             query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
+            airport_data=_aviation_result_text(airports, "airport lookup"),
+            airline_data=_aviation_result_text(airlines, "airline lookup"),
         )
 
         response = llm.invoke(
             [
                 SystemMessage(content="You are an expert travel flight planner."),
-                HumanMessage(content=prompt),
+                HumanMessage(
+                    content=(
+                        prompt
+                        + "\nIf live airport or airline data is unavailable, "
+                        "say so clearly. Do not present provider errors as data "
+                        "or invent live availability."
+                    )
+                ),
             ]
         )
         flight_data = response.content
@@ -398,9 +445,29 @@ def hotel_agent(state: TravelState):
 # Weather Agent - original behavior kept
 # =========================
 def weather_agent(state: TravelState):
-    city = extract_destination(
-        state["user_query"]
-    )
+    city = str(
+        state.get("trip_constraints", {}).get("destination", "")
+    ).strip()
+
+    if not city:
+        try:
+            city = extract_destination(
+                _prompt_excerpt(state["user_query"], 1200)
+            )
+        except ValueError as exc:
+            print(f"WEATHER DESTINATION ERROR: {exc}", flush=True)
+
+    if not city:
+        return {
+            "weather_results": (
+                "Weather information is unavailable because a destination "
+                "could not be identified. Ask the traveler to specify a city "
+                "or country."
+            ),
+            "messages": [
+                AIMessage(content="Weather destination could not be identified.")
+            ],
+        }
 
     try:
         weather_data = asyncio.run(
@@ -451,19 +518,19 @@ def budget_agent(state: TravelState):
 Analyze whether this trip is realistic for the user's budget.
 
 User Query:
-{state['user_query']}
+{_prompt_excerpt(state['user_query'], 1200)}
 
 Trip Constraints:
-{state.get('trip_constraints', {})}
+{_prompt_excerpt(state.get('trip_constraints', {}), 500)}
 
 Flight Results:
-{state.get('flight_results', '')}
+{_prompt_excerpt(state.get('flight_results', ''))}
 
 Hotel Results:
-{state.get('hotel_results', '')}
+{_prompt_excerpt(state.get('hotel_results', ''))}
 
 Weather Results:
-{state.get('weather_results', '')}
+{_prompt_excerpt(state.get('weather_results', ''))}
 
 Return:
 1. Estimated cost categories
@@ -496,22 +563,22 @@ def itinerary_agent(state: TravelState):
 Create a complete travel itinerary.
 
 User Query:
-{state['user_query']}
+{_prompt_excerpt(state['user_query'], 1200)}
 
 Trip Constraints:
-{state.get('trip_constraints', {})}
+{_prompt_excerpt(state.get('trip_constraints', {}), 500)}
 
 Flight Results:
-{state.get('flight_results', '')}
+{_prompt_excerpt(state.get('flight_results', ''))}
 
 Hotel Results:
-{state.get('hotel_results', '')}
+{_prompt_excerpt(state.get('hotel_results', ''))}
 
 Weather Results:
-{state.get('weather_results', '')}
+{_prompt_excerpt(state.get('weather_results', ''))}
 
 Budget Results:
-{state.get('budget_results', '')}
+{_prompt_excerpt(state.get('budget_results', ''))}
 
 Make the itinerary practical, budget-aware, and easy to follow.
 Create a clear draft that is ready for human review.
@@ -559,11 +626,39 @@ def human_approval_agent(state: TravelState):
     approved = bool(review.get("approved", False))
     human_feedback = str(review.get("feedback", "")).strip()
 
-    return {
+    result = {
         "approved": approved,
         "human_feedback": human_feedback,
         "messages": [AIMessage(content="Human approval step completed.")],
     }
+
+    if not approved:
+        result.update(
+            {
+                "user_query": (
+                    f"{state['user_query']}\n\n"
+                    "Latest traveler revision (takes precedence over any "
+                    "conflicting earlier details):\n"
+                    f"{human_feedback}\n\n"
+                    "Create a revised travel plan using this latest revision. "
+                    "Keep the original requirements that were not changed."
+                ),
+                "guardrail_allowed": True,
+                "guardrail_reason": "",
+                "selected_agents": [],
+                "trip_constraints": _empty_constraints(),
+                "supervisor_reasoning": "",
+                "flight_results": "",
+                "hotel_results": "",
+                "weather_results": "",
+                "budget_results": "",
+                "itinerary": "",
+                "approval_request": "",
+                "final_response": "",
+            }
+        )
+
+    return result
 
 
 # =========================
@@ -577,7 +672,7 @@ def final_agent(state: TravelState):
     else:
         review_instruction = f"""
 The user requested a revision. Apply this feedback carefully:
-{state.get('human_feedback', '') or 'Improve the draft before finalizing it.'}
+{_prompt_excerpt(state.get('human_feedback', '') or 'Improve the draft before finalizing it.', 500)}
 """
 
     final_prompt = f"""
@@ -587,25 +682,25 @@ Human Review:
 {review_instruction}
 
 User Request:
-{state['user_query']}
+{_prompt_excerpt(state['user_query'], 1200)}
 
 Supervisor Constraints:
-{state.get('trip_constraints', {})}
+{_prompt_excerpt(state.get('trip_constraints', {}), 500)}
 
 Flights:
-{state.get('flight_results', '')}
+{_prompt_excerpt(state.get('flight_results', ''))}
 
 Hotels:
-{state.get('hotel_results', '')}
+{_prompt_excerpt(state.get('hotel_results', ''))}
 
 Weather:
-{state.get('weather_results', '')}
+{_prompt_excerpt(state.get('weather_results', ''))}
 
 Budget Analysis:
-{state.get('budget_results', '')}
+{_prompt_excerpt(state.get('budget_results', ''))}
 
 Draft Itinerary:
-{state.get('itinerary', '')}
+{_prompt_excerpt(state.get('itinerary', ''))}
 
 Format the final answer beautifully using these sections:
 1. Trip Summary
@@ -680,6 +775,10 @@ def route_after_agent(current_agent: str):
     return route
 
 
+def route_after_approval(state: TravelState) -> str:
+    return "final_agent" if state.get("approved", False) else "supervisor"
+
+
 # =========================
 # Build Graph
 # =========================
@@ -712,7 +811,14 @@ graph.add_conditional_edges(
 )
 
 graph.add_edge("itinerary_agent", "human_approval")
-graph.add_edge("human_approval", "final_agent")
+graph.add_conditional_edges(
+    "human_approval",
+    route_after_approval,
+    {
+        "supervisor": "supervisor",
+        "final_agent": "final_agent",
+    },
+)
 graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 

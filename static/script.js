@@ -82,16 +82,25 @@ function showWorkflow(data) {
   section.classList.remove("hidden");
 }
 
-function showResult(answer, threadId, isDraft = false) {
+function showResult(answer, threadId, isDraft = false, latencyMs = null) {
   latestAnswerMarkdown = answer || "";
 
   const resultSection = document.getElementById("resultSection");
   const resultBox = document.getElementById("resultBox");
   const threadInfo = document.getElementById("threadInfo");
+  const responseTime = document.getElementById("responseTime");
   const resultTitle = document.getElementById("resultTitle");
 
   renderMarkdown(resultBox, latestAnswerMarkdown);
   threadInfo.textContent = `Thread ID: ${threadId}`;
+  if (Number.isFinite(latencyMs)) {
+    const formattedLatency = latencyMs >= 1000
+      ? `${(latencyMs / 1000).toFixed(2)} s`
+      : `${latencyMs.toFixed(2)} ms`;
+    responseTime.textContent = `Server processing time: ${formattedLatency}`;
+  } else {
+    responseTime.textContent = "";
+  }
   resultTitle.textContent = isDraft ? "Draft Travel Plan" : "Your Final AI Travel Plan";
   resultSection.classList.remove("hidden");
 
@@ -158,11 +167,16 @@ async function sendMessage() {
     showWorkflow(data);
 
     if (data.requires_approval) {
-      showResult(data.itinerary || data.answer, data.thread_id, true);
+      showResult(
+        data.itinerary || data.answer,
+        data.thread_id,
+        true,
+        data.server_latency_ms
+      );
       showApproval(data);
     } else {
       hideApproval();
-      showResult(data.answer, data.thread_id, false);
+      showResult(data.answer, data.thread_id, false, data.server_latency_ms);
     }
   } catch (error) {
     showError(error.message);
@@ -210,8 +224,18 @@ async function submitApproval(approved) {
     }
 
     showWorkflow(data);
-    hideApproval();
-    showResult(data.answer, data.thread_id, false);
+    if (data.requires_approval) {
+      showResult(
+        data.itinerary || data.answer,
+        data.thread_id,
+        true,
+        data.server_latency_ms
+      );
+      showApproval(data);
+    } else {
+      hideApproval();
+      showResult(data.answer, data.thread_id, false, data.server_latency_ms);
+    }
   } catch (error) {
     showError(error.message);
   } finally {

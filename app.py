@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 import traceback
 
 import uvicorn
@@ -58,6 +59,8 @@ async def home(request: Request):
 
 @app.post("/api/travel")
 async def travel_planner(request_data: TravelRequest):
+    started_at = time.perf_counter()
+
     try:
         user_message = request_data.message.strip()
 
@@ -79,6 +82,10 @@ async def travel_planner(request_data: TravelRequest):
             content={
                 "success": True,
                 **result,
+                "server_latency_ms": round(
+                    (time.perf_counter() - started_at) * 1000,
+                    2,
+                ),
             }
         )
 
@@ -97,6 +104,8 @@ async def travel_planner(request_data: TravelRequest):
 
 @app.post("/api/travel/approve")
 async def approve_travel_plan(request_data: ApprovalRequest):
+    started_at = time.perf_counter()
+
     try:
         if not request_data.approved and not request_data.feedback.strip():
             return JSONResponse(
@@ -117,6 +126,10 @@ async def approve_travel_plan(request_data: ApprovalRequest):
             content={
                 "success": True,
                 **result,
+                "server_latency_ms": round(
+                    (time.perf_counter() - started_at) * 1000,
+                    2,
+                ),
             }
         )
 
