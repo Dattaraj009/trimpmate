@@ -364,8 +364,13 @@ def flight_agent(state: TravelState):
     query = _prompt_excerpt(state["user_query"], 1200)
 
     try:
-        airports = asyncio.run(aviation_mcp_call("list_airports"))
-        airlines = asyncio.run(aviation_mcp_call("list_airlines"))
+        async def fetch_flight_reference_data():
+            return await asyncio.gather(
+                aviation_mcp_call("list_airports"),
+                aviation_mcp_call("list_airlines"),
+            )
+
+        airports, airlines = asyncio.run(fetch_flight_reference_data())
 
         print("\nAIRPORTS:", airports)
         print("\nAIRLINES:", airlines)
@@ -470,13 +475,13 @@ def weather_agent(state: TravelState):
         }
 
     try:
-        weather_data = asyncio.run(
-            weather_mcp_search(city)
-        )
+        async def fetch_weather_data():
+            return await asyncio.gather(
+                weather_mcp_search(city),
+                forecast_mcp_search(city),
+            )
 
-        forecast_data = asyncio.run(
-            forecast_mcp_search(city)
-        )
+        weather_data, forecast_data = asyncio.run(fetch_weather_data())
 
         weather_results = f"""
 Current Weather:
